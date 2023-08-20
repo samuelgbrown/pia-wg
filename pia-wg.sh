@@ -112,6 +112,10 @@ fi
 
 source "$PIA_CONFIG"
 
+# Note:  You may change these values here *if this is the first time you are running this script*!
+# Otherwise, please change these values in the generated config file, located for root at /etc/pia-wg/pia-wg.conf, or
+# for other users at $HOME/.config/pia-wg/pia-wg.conf
+
 if ! [ -r "$CONFIG" ]
 then
 	echo "Cannot read '$CONFIG', generating a default one"
@@ -148,8 +152,8 @@ CLIENT_PRIVATE_KEY="$CLIENT_PRIVATE_KEY"
 # VPNONLY_ROUTE_TABLE="vpnonly"
 
 # post-portforward hook
-# you can use \$PF_PORT for the received port numberr
-# PORTFORWARD_HOOK="my_program \$PF_PORT"
+# you can use \$PF_PORT for the received port number
+# portforward_hook() { my_program \$PF_PORT; }
 ENDCONFIG
 	echo "Config saved"
 fi
@@ -182,6 +186,7 @@ fi
 
 if [ -r "$CONNCACHE" ]
 then
+	echo "Reading connection cache..."
 	WG_NAME="$(jq -r ".name" "$CONNCACHE")"
 	WG_DNS="$(jq -r ".dns"  "$CONNCACHE")"
 
@@ -192,8 +197,11 @@ then
 	WG_SN="$(cut -d. -f1 <<< "$WG_DNS")"
 fi
 
-if [ -z "$WG_HOST" ] || [ -z "$WG_CN" ] || [ -z "$WG_PORT" ]
+
+if [[ $WG_SN != $LOC ]] || [ -z "$WG_HOST" ] || [ -z "$WG_CN" ] || [ -z "$WG_PORT" ]
 then
+	echo "Re-checking for servers that match location! (old=$WG_SN, new=$LOC)"
+	ORIGINAL_LOC=$LOC
 	if [ "$(jq -r ".regions | .[] | select(.id == \"$LOC\")" "$DATAFILE_NEW")" == "" ]
 	then
 		LOC=$(jq -r '.regions | .[] | select(.id | test("^'"$LOC"'")) '${PORTFORWARD:+'| select(.port_forward) '}'| .id' "$DATAFILE_NEW" | shuf -n 1)
@@ -201,16 +209,23 @@ then
 
 	if [ "$(jq -r ".regions | .[] | select(.id == \"$LOC\")" "$DATAFILE_NEW")" == "" ]
 	then
-		echo "Location $LOC not found!"
-		echo "Options are:"
-	# 	jq '.regions | .[] | .id' "$DATAFILE_NEW" | sort | sed -e 's/^/ * /'
-		(
-			echo "${BOLD}Location${TAB}Region${TAB}Port Forward${TAB}Geolocated${NORMAL}"
-			echo "----------------${TAB}------------------${TAB}------------${TAB}----------"
-			jq -r '.regions | .[] | '${PORTFORWARD:+'| select(.port_forward)'}' [.id, .name, .port_forward, .geo] | "'$'\e''[1m\(.[0])'$'\e''[0m\t\(.[1])\t\(.[2])\t\(.[3])"' "$DATAFILE_NEW" | sort
-		) | column -t -s "${TAB}"
-		echo "${PORTFORWARD:+'Note: only port-forwarding regions displayed'}"
-		echo "Please edit $CONFIG and change your desired location, then try again"
+		echo "Could not find location that starts with $ORIGINAL_LOC (or it doesn't have port forwarding)!"
+		POSSIBLE_LOCS=( $(jq -r ".regions | .[] | select(.id | contains(\"$ORIGINAL_LOC\")) | .id" "$DATAFILE_NEW") )
+		if [ -n "$POSSIBLE_LOCS" ]
+		then
+			echo "Did you mean one of the following?"
+			printf '\t* %s\n' "${POSSIBLE_LOCS[@]}"
+		else
+			echo "Options are:"
+		# 	jq '.regions | .[] | .id' "$DATAFILE_NEW" | sort | sed -e 's/^/ * /'
+			(
+				echo "${BOLD}Location${TAB}Region${TAB}Port Forward${TAB}Geolocated${NORMAL}"
+				echo "----------------${TAB}------------------${TAB}------------${TAB}----------"
+				jq -r '.regions | .[] | '${PORTFORWARD:+'| select(.port_forward)'}' [.id, .name, .port_forward, .geo] | "'$'\e''[1m\(.[0])'$'\e''[0m\t\(.[1])\t\(.[2])\t\(.[3])"' "$DATAFILE_NEW" | sort
+			) | column -t -s "${TAB}"
+			echo "${PORTFORWARD:+'Note: only port-forwarding regions displayed'}"
+			echo "Please edit $CONFIG and change your desired location, then try again"
+		fi
 		exit 1
 	fi
 
@@ -232,6 +247,7 @@ then
 
 	WG_SN="$(cut -d. -f1 <<< "$WG_DNS")"
 fi
+echo "Using location $WG_NAME"
 
 if [ -z "$WG_HOST$WG_PORT" ]; then
   echo "wg host/port not found (bad server list?), exiting"
@@ -425,7 +441,7 @@ then
 
 		# Note: unnecessary if Table != off above, but doesn't hurt.
 		# ensure we don't get a packet storm loop
-		ip rule add fwmark 51820 lookup "$HARDWARE_ROUTE_TABLE" pref 10
+		ip rule add fwmark 51820 lookup "$HARDWARE_ROUTE_TABLE" pref 10 2>/dev/null
 
 		if [ "$OLD_KEY" != "$SERVER_PUBLIC_KEY" ]
 		then
@@ -435,27 +451,29 @@ then
 			wg set "$PIA_INTERFACE" peer "$OLD_KEY" remove
 		fi
 
-		if [ "$PEER_IP" != "$OLD_PEER_IP/32" ]
+		if [ "$PEER_IP" != "$OLD_PEER_IP" ]
 		then
 			echo "    [Change $PIA_INTERFACE ipaddr from $OLD_PEER_IP to $PEER_IP]"
 			# update link ip address in case
 			ip addr replace "$PEER_IP" dev "$PIA_INTERFACE"
-			ip addr del "$OLD_PEER_IP/32" dev "$PIA_INTERFACE"
+			ip addr del "$OLD_PEER_IP" dev "$PIA_INTERFACE"
 
 			# remove old route
 			ip rule del to "$OLD_PEER_IP" lookup "$HARDWARE_ROUTE_TABLE" 2>/dev/null
 		fi
 
 		# Note: only if Table = off in wireguard config file above
-		ip route add default dev "$PIA_INTERFACE"
+		ip route add default dev "$PIA_INTERFACE" 2>/dev/null
 
 		# Specific to my setup
-		ip route add default table "$VPNONLY_ROUTE_TABLE" dev "$PIA_INTERFACE"
+		ip route add default table "$VPNONLY_ROUTE_TABLE" dev "$PIA_INTERFACE" 2>/dev/null
+
 	else
+
 		echo "Bringing up interface '$PIA_INTERFACE'"
 
 		# Note: unnecessary if Table != off above, but doesn't hurt.
-		ip rule add fwmark 51820 lookup "$HARDWARE_ROUTE_TABLE" pref 10
+		ip rule add fwmark 51820 lookup "$HARDWARE_ROUTE_TABLE" pref 10 2>/dev/null
 
 		# bring up wireguard interface
 		ip link add "$PIA_INTERFACE" type wireguard || exit 1
@@ -464,10 +482,10 @@ then
 		ip addr replace "$PEER_IP" dev "$PIA_INTERFACE" || exit 1
 
 		# Note: only if Table = off in wireguard config file above
-		ip route add default dev "$PIA_INTERFACE"
+		ip route add default dev "$PIA_INTERFACE" 2</dev/null
 
 		# Specific to my setup
-		ip route add default table "$VPNONLY_ROUTE_TABLE" dev "$PIA_INTERFACE"
+		ip route add default table "$VPNONLY_ROUTE_TABLE" dev "$PIA_INTERFACE" 2>/dev/null
 
 	fi
 else
